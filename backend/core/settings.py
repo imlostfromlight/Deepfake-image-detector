@@ -121,3 +121,13 @@ USE_TZ = True
 STATIC_URL = 'static/'
 
 CORS_ALLOW_ALL_ORIGINS = True
+
+# Sightengine API credentials (deepfake detection)
+# Sign up free at https://sightengine.com — 2,000 free ops/month
+# Add your keys from https://dashboard.sightengine.com/api-credentials
+SIGHTENGINE_API_USER = '323922257'
+SIGHTENGINE_API_SECRET ='9LUMbiEUawcuYZ5rHYK6UMwT3prsHQdS'
+
+# CLIP + LoRA deepfake detector
+DEEPFAKE_MODEL_PATH = BASE_DIR / 'detector_best.pt'
+DEEPFAKE_THRESHOLD  = 0.918

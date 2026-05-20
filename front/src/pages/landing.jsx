@@ -1,12 +1,13 @@
 import React, { useState, useCallback } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { Search, Eye, Zap } from 'lucide-react';
-import { Shield, Upload, Loader2, AlertTriangle, CheckCircle2, FileImage } from 'lucide-react';
+import { Shield, Upload, Loader2, AlertTriangle, CheckCircle2, FileImage, Monitor, FileText, Camera, Info, ChevronDown, ChevronUp } from 'lucide-react';
 
-const LandingPage = ({ onStartLive }) => {
+const LandingPage = ({ onStartLive, onStartVideoCall, onStartDocument, onStartVideoLink }) => {
     const [imagePreview, setImagePreview] = useState(null);
     const [result, setResult] = useState(null);
     const [loading, setLoading] = useState(false);
+    const [showAnalysis, setShowAnalysis] = useState(false);
 
     // Backend Connection Logic
     const onDrop = useCallback(async (acceptedFiles) => {
@@ -17,9 +18,11 @@ const LandingPage = ({ onStartLive }) => {
         setImagePreview(URL.createObjectURL(file));
         setLoading(true);
         setResult(null);
+        setShowAnalysis(false);
 
         const formData = new FormData();
         formData.append('image', file);
+        formData.append('source', 'upload');
 
         try {
             const response = await fetch('http://localhost:8000/api/detect/', {
@@ -93,7 +96,7 @@ const LandingPage = ({ onStartLive }) => {
                         </div>
                     </div>
 
-                    <div className="mt-8 flex justify-center">
+                    <div className="mt-8 flex flex-wrap justify-center gap-3">
                         <button
                             onClick={onStartLive}
                             className="flex items-center gap-2 bg-slate-900 text-white px-6 py-3 rounded-full hover:bg-slate-800 transition shadow-lg hover:shadow-xl transform hover:-translate-y-1"
@@ -102,61 +105,221 @@ const LandingPage = ({ onStartLive }) => {
                                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
                                 <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500"></span>
                             </span>
-                            <span className="font-semibold">Switch to Live Camera Check</span>
+                            <span className="font-semibold">Live Camera Check</span>
+                        </button>
+                        <button
+                            onClick={onStartVideoCall}
+                            className="flex items-center gap-2 bg-blue-600 text-white px-6 py-3 rounded-full hover:bg-blue-700 transition shadow-lg hover:shadow-xl transform hover:-translate-y-1"
+                        >
+                            <Monitor className="w-4 h-4" />
+                            <span className="font-semibold">Video Call Scan</span>
+                        </button>
+                        <button
+                            onClick={onStartDocument}
+                            className="flex items-center gap-2 bg-violet-600 text-white px-6 py-3 rounded-full hover:bg-violet-700 transition shadow-lg hover:shadow-xl transform hover:-translate-y-1"
+                        >
+                            <FileText className="w-4 h-4" />
+                            <span className="font-semibold">Document Scan</span>
+                        </button>
+                        <button
+                            onClick={onStartVideoLink}
+                            className="flex items-center gap-2 bg-pink-600 text-white px-6 py-3 rounded-full hover:bg-pink-700 transition shadow-lg hover:shadow-xl transform hover:-translate-y-1"
+                        >
+                            <span className="font-semibold">🎵 TikTok / Reels / Shorts</span>
                         </button>
                     </div>
 
                     {/* Analysis & Preview Section */}
-                    <div className="mt-12 grid md:grid-cols-2 gap-8 items-start">
-                        {/* Image Preview */}
-                        <div className="bg-white p-3 rounded-2xl shadow-xl border border-slate-200">
-                            {imagePreview ? (
-                                <img src={imagePreview} className="w-full h-64 object-cover rounded-xl" alt="To be analyzed" />
-                            ) : (
-                                <div className="h-64 flex flex-col items-center justify-center text-slate-400 bg-slate-50 rounded-xl">
-                                    <FileImage className="w-10 h-10 mb-2" />
-                                    <p>No image uploaded</p>
-                                </div>
-                            )}
+                    <div className="mt-12 space-y-6 text-left">
+
+                        {/* Image + Heatmap row */}
+                        <div className="grid md:grid-cols-2 gap-6">
+                            <div className="bg-white p-3 rounded-2xl shadow-xl border border-slate-200">
+                                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 px-1">Original</p>
+                                {imagePreview ? (
+                                    <img src={imagePreview} className="w-full h-64 object-cover rounded-xl" alt="Uploaded" />
+                                ) : (
+                                    <div className="h-64 flex flex-col items-center justify-center text-slate-400 bg-slate-50 rounded-xl">
+                                        <FileImage className="w-10 h-10 mb-2" />
+                                        <p>No image uploaded</p>
+                                    </div>
+                                )}
+                            </div>
+
+                            <div className="bg-white p-3 rounded-2xl shadow-xl border border-slate-200">
+                                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 px-1">
+                                    GradCAM++ Heatmap <span className="normal-case font-normal">(red = regions model focused on)</span>
+                                </p>
+                                {loading ? (
+                                    <div className="h-64 flex flex-col items-center justify-center bg-slate-50 rounded-xl text-slate-400">
+                                        <Loader2 className="w-8 h-8 animate-spin mb-2 text-blue-500" />
+                                        <p className="text-sm animate-pulse">Generating heatmap...</p>
+                                    </div>
+                                ) : result?.heatmap ? (
+                                    <img src={result.heatmap} className="w-full h-64 object-cover rounded-xl" alt="GradCAM heatmap" />
+                                ) : (
+                                    <div className="h-64 flex flex-col items-center justify-center text-slate-400 bg-slate-50 rounded-xl">
+                                        <Eye className="w-10 h-10 mb-2 opacity-30" />
+                                        <p className="text-sm">Heatmap appears after upload</p>
+                                    </div>
+                                )}
+                            </div>
                         </div>
 
-                        {/* Results Card */}
-                        <div className="h-full">
-                            {loading ? (
-                                <div className="bg-white p-8 rounded-2xl border border-slate-200 h-64 flex flex-col items-center justify-center">
-                                    <Loader2 className="w-8 h-8 text-blue-600 animate-spin mb-4" />
-                                    <p className="font-medium animate-pulse">Running ViT-v2 Inference...</p>
-                                </div>
-                            ) : result ? (
-                                <div className={`p-8 rounded-2xl border-2 h-64 flex flex-col justify-center transition-all ${result.prediction === 'fake' ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200'
-                                    }`}>
-                                    <div className="flex items-center gap-3 mb-4">
-                                        {result.prediction === 'fake' ?
-                                            <AlertTriangle className="text-red-600 w-8 h-8" /> :
-                                            <CheckCircle2 className="text-green-600 w-8 h-8" />
-                                        }
-                                        <h3 className="text-3xl font-bold capitalize">{result.prediction}</h3>
+                        {/* Verdict + full breakdown */}
+                        {loading ? (
+                            <div className="bg-white p-8 rounded-2xl border border-slate-200 flex flex-col items-center justify-center">
+                                <Loader2 className="w-8 h-8 text-blue-600 animate-spin mb-4" />
+                                <p className="font-semibold animate-pulse">Running ensemble inference + GradCAM...</p>
+                                <p className="text-xs text-slate-400 mt-1">3 models × 6 TTA variants + FFT + EXIF</p>
+                            </div>
+                        ) : result ? (
+                            <div className={`rounded-2xl border-2 overflow-hidden transition-all ${
+                                result.overall === 'real' ? 'border-green-200' : 'border-red-200'
+                            }`}>
+                                {/* Verdict header */}
+                                <div className={`p-6 flex items-center gap-4 ${result.overall === 'real' ? 'bg-green-50' : 'bg-red-50'}`}>
+                                    {result.overall === 'real'
+                                        ? <CheckCircle2 className="text-green-600 w-10 h-10 shrink-0" />
+                                        : <AlertTriangle className="text-red-600 w-10 h-10 shrink-0" />
+                                    }
+                                    <div className="flex-1">
+                                        <h3 className={`text-3xl font-black capitalize ${result.overall === 'real' ? 'text-green-700' : 'text-red-700'}`}>
+                                            {result.overall}
+                                        </h3>
+                                        <p className={`text-sm ${result.overall === 'real' ? 'text-green-600' : 'text-red-600'}`}>
+                                            {result.deepfake?.confidence}% confidence · threshold {result.analysis?.threshold}%
+                                        </p>
                                     </div>
-                                    <div className="space-y-2">
-                                        <div className="flex justify-between text-sm font-bold uppercase text-slate-500">
-                                            <span>Confidence Score</span>
-                                            <span>{result.confidence}%</span>
+                                    <div className="w-24 text-right">
+                                        <div className={`text-2xl font-black ${result.overall === 'real' ? 'text-green-600' : 'text-red-600'}`}>
+                                            {result.deepfake?.confidence}%
                                         </div>
-                                        <div className="w-full bg-slate-200 rounded-full h-3">
-                                            <div
-                                                className={`h-3 rounded-full transition-all duration-1000 ${result.prediction === 'fake' ? 'bg-red-500' : 'bg-green-500'}`}
-                                                style={{ width: `${result.confidence}%` }}
-                                            />
-                                        </div>
-                                        <p className="text-xs text-slate-400 mt-4 italic">Analysis powered by PrithivML Deep-Fake-Detector-v2</p>
                                     </div>
                                 </div>
-                            ) : (
-                                <div className="bg-slate-100 p-8 rounded-2xl border border-slate-200 h-64 flex items-center justify-center text-slate-400">
-                                    <p>Results will appear here</p>
+
+                                {/* Confidence bar */}
+                                <div className="px-6 py-2 bg-white">
+                                    <div className="w-full bg-slate-100 rounded-full h-2.5 relative">
+                                        <div
+                                            className={`h-2.5 rounded-full transition-all duration-1000 ${result.overall === 'real' ? 'bg-green-500' : 'bg-red-500'}`}
+                                            style={{ width: `${result.deepfake?.confidence}%` }}
+                                        />
+                                        {/* Threshold marker */}
+                                        <div
+                                            className="absolute top-0 h-2.5 w-0.5 bg-slate-400"
+                                            style={{ left: `${result.analysis?.threshold}%` }}
+                                            title={`Threshold: ${result.analysis?.threshold}%`}
+                                        />
+                                    </div>
                                 </div>
-                            )}
-                        </div>
+
+                                {/* Score breakdown toggle */}
+                                <button
+                                    onClick={() => setShowAnalysis(v => !v)}
+                                    className="w-full px-6 py-3 bg-white border-t border-slate-100 flex items-center justify-between text-sm font-semibold text-slate-600 hover:bg-slate-50 transition"
+                                >
+                                    <span className="flex items-center gap-2">
+                                        <Info className="w-4 h-4 text-blue-500" />
+                                        Decision breakdown — every step explained
+                                    </span>
+                                    {showAnalysis ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                                </button>
+
+                                {showAnalysis && (
+                                    <div className="bg-slate-50 border-t border-slate-100 p-6 space-y-5">
+
+                                        {/* Score pipeline */}
+                                        <div>
+                                            <p className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">Score pipeline</p>
+                                            <div className="space-y-2">
+                                                <ScoreRow
+                                                    label="ML ensemble (3 models × 6 TTA variants)"
+                                                    desc="Average fake probability across PrithivModel + DimaModel + ThirdModel, each run on 6 augmented copies of the face."
+                                                    value={result.analysis?.ml_score}
+                                                    max={100}
+                                                    color="blue"
+                                                />
+                                                <ScoreRow
+                                                    label="FFT frequency analysis"
+                                                    desc="GAN upsampling leaves periodic checkerboard artifacts in the 2D frequency spectrum. Real photos have smooth spectra."
+                                                    value={result.analysis?.fft_score}
+                                                    max={100}
+                                                    color="purple"
+                                                />
+                                                <ScoreRow
+                                                    label="EXIF metadata correction"
+                                                    desc={result.analysis?.meta_adjustment < 0
+                                                        ? "Camera EXIF detected → reduces fake probability (AI images never have real camera metadata)."
+                                                        : "No camera EXIF found → slight suspicion increase."}
+                                                    value={Math.abs(result.analysis?.meta_adjustment)}
+                                                    max={15}
+                                                    color={result.analysis?.meta_adjustment < 0 ? "green" : "orange"}
+                                                    prefix={result.analysis?.meta_adjustment < 0 ? "−" : "+"}
+                                                />
+                                                <div className="pt-2 border-t border-slate-200 flex justify-between items-center">
+                                                    <span className="text-sm font-bold text-slate-700">Final score vs threshold</span>
+                                                    <span className="font-black text-lg text-slate-800">
+                                                        {result.analysis?.final_score}% &gt; {result.analysis?.threshold}%?
+                                                        {' '}{result.analysis?.final_score >= result.analysis?.threshold ? '→ DEEPFAKE' : '→ REAL'}
+                                                    </span>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        {/* EXIF signals */}
+                                        <div>
+                                            <p className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">EXIF metadata signals</p>
+                                            {result.metadata?.authenticity_signals?.length > 0 && (
+                                                <div className="flex flex-wrap gap-2 mb-2">
+                                                    {result.metadata.authenticity_signals.map((s, i) => (
+                                                        <span key={i} className="flex items-center gap-1 text-xs px-2 py-1 bg-green-100 text-green-700 rounded-full">
+                                                            <CheckCircle2 className="w-3 h-3" />{s}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            )}
+                                            {result.metadata?.suspicion_signals?.length > 0 && (
+                                                <div className="flex flex-wrap gap-2">
+                                                    {result.metadata.suspicion_signals.map((s, i) => (
+                                                        <span key={i} className="flex items-center gap-1 text-xs px-2 py-1 bg-amber-100 text-amber-700 rounded-full">
+                                                            <AlertTriangle className="w-3 h-3" />{s}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            )}
+                                            {!result.metadata?.has_exif && (
+                                                <span className="text-xs px-2 py-1 bg-slate-200 text-slate-500 rounded-full">No EXIF data found</span>
+                                            )}
+                                        </div>
+
+                                        {/* What to look for */}
+                                        <div>
+                                            <p className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">How to spot deepfakes visually</p>
+                                            <div className="grid grid-cols-2 gap-2 text-xs text-slate-600">
+                                                {[
+                                                    ['Face edges', 'Blurring or colour mismatch where face meets hair/neck'],
+                                                    ['Teeth & inner mouth', 'Often smeared, wrong count, or unnaturally bright'],
+                                                    ['Eye reflections', 'Light source inconsistent with rest of scene'],
+                                                    ['Skin texture', 'Overly smooth — no pores, uniform pigmentation'],
+                                                    ['Ear detail', 'Frequently missing, misshapen, or copied from wrong angle'],
+                                                    ['Background halo', 'Slight glow or blur ring around the face outline'],
+                                                ].map(([title, desc]) => (
+                                                    <div key={title} className="p-2 bg-white rounded-lg border border-slate-200">
+                                                        <p className="font-bold text-slate-700">{title}</p>
+                                                        <p className="text-slate-500 mt-0.5">{desc}</p>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        ) : (
+                            <div className="bg-slate-100 p-8 rounded-2xl border border-slate-200 flex items-center justify-center text-slate-400">
+                                <p>Results will appear here after upload</p>
+                            </div>
+                        )}
                     </div>
                 </div>
             </header>
@@ -253,6 +416,30 @@ const LandingPage = ({ onStartLive }) => {
         </div>
     );
 };
+const colorMap = {
+    blue:   { bar: 'bg-blue-500',   text: 'text-blue-700',   bg: 'bg-blue-50' },
+    purple: { bar: 'bg-purple-500', text: 'text-purple-700', bg: 'bg-purple-50' },
+    green:  { bar: 'bg-green-500',  text: 'text-green-700',  bg: 'bg-green-50' },
+    orange: { bar: 'bg-amber-500',  text: 'text-amber-700',  bg: 'bg-amber-50' },
+};
+
+const ScoreRow = ({ label, desc, value, max, color, prefix = '' }) => {
+    const c = colorMap[color] || colorMap.blue;
+    const pct = Math.min(100, Math.max(0, (value / max) * 100));
+    return (
+        <div className={`p-3 rounded-xl ${c.bg}`}>
+            <div className="flex justify-between items-center mb-1">
+                <span className="text-xs font-semibold text-slate-700">{label}</span>
+                <span className={`text-xs font-black ${c.text}`}>{prefix}{value?.toFixed(1)}%</span>
+            </div>
+            <div className="w-full bg-white/60 rounded-full h-1.5 mb-1.5">
+                <div className={`h-1.5 rounded-full ${c.bar}`} style={{ width: `${pct}%`, transition: 'width 0.8s ease' }} />
+            </div>
+            <p className="text-xs text-slate-500">{desc}</p>
+        </div>
+    );
+};
+
 const FeatureCard = ({ icon, title, desc }) => (
     <div className="p-8 bg-white rounded-2xl border border-slate-100 shadow-sm hover:shadow-md transition group">
         <div className="w-12 h-12 bg-blue-50 rounded-xl flex items-center justify-center mb-6 group-hover:bg-blue-600 group-hover:text-white transition-colors">
