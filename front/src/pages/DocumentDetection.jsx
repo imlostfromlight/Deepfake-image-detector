@@ -1,11 +1,90 @@
 import React, { useState, useCallback } from 'react';
 import { useDropzone } from 'react-dropzone';
-import { Shield, ArrowLeft, FileText, Loader2, CheckCircle2, AlertTriangle, FileImage } from 'lucide-react';
+import { Shield, ArrowLeft, FileText, Loader2, CheckCircle2, AlertTriangle, FileImage, Eye, Layers } from 'lucide-react';
 
+/* ── Visualization tab component reused per image ──────────────────────────── */
+const VizTabs = ({ item }) => {
+    const [tab, setTab] = useState('face');
+    const tabs = [
+        { key: 'face',    label: 'Face crop' },
+        { key: 'heatmap', label: 'GradCAM heatmap' },
+        { key: 'ela',     label: 'ELA map' },
+    ];
+
+    const src =
+        tab === 'face'    ? item.deepfake?.face_crop :
+        tab === 'heatmap' ? item.deepfake?.heatmap   :
+                            item.deepfake?.ela_map;
+
+    const hint =
+        tab === 'face'    ? 'Aligned face extracted from the document' :
+        tab === 'heatmap' ? 'Red = regions the model focused on for this verdict' :
+                            'Bright areas show inconsistent JPEG compression — editing hotspots';
+
+    return (
+        <div className="mt-3 rounded-xl overflow-hidden border border-slate-200 bg-white">
+            {/* Tab bar */}
+            <div className="flex border-b border-slate-100">
+                {tabs.map(t => (
+                    <button
+                        key={t.key}
+                        onClick={() => setTab(t.key)}
+                        className={`flex-1 py-1.5 text-xs font-semibold uppercase tracking-wider transition
+                            ${tab === t.key
+                                ? 'bg-blue-600 text-white'
+                                : 'text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
+                    >
+                        {t.label}
+                    </button>
+                ))}
+            </div>
+
+            {/* Hint text */}
+            <p className="text-xs text-slate-400 px-3 pt-1.5">{hint}</p>
+
+            {/* Image */}
+            <div className="p-2">
+                {src ? (
+                    <img src={src} alt={tab} className="w-full max-h-56 object-contain rounded-lg bg-slate-50" />
+                ) : (
+                    <div className="h-32 flex items-center justify-center text-slate-400 text-xs bg-slate-50 rounded-lg">
+                        {tab === 'face'    && <><FileImage className="w-5 h-5 mr-1.5 opacity-40" />No face detected</>}
+                        {tab === 'heatmap' && <><Eye     className="w-5 h-5 mr-1.5 opacity-40" />Heatmap unavailable</>}
+                        {tab === 'ela'     && <><Layers  className="w-5 h-5 mr-1.5 opacity-40" />ELA unavailable</>}
+                    </div>
+                )}
+            </div>
+
+            {/* ELA score bar */}
+            {tab === 'ela' && item.deepfake?.ela_score !== undefined && (
+                <div className="px-3 pb-2">
+                    <div className="flex justify-between text-xs text-slate-500 mb-1">
+                        <span>ELA score: <span className={`font-bold ${
+                            item.deepfake.ela_score > 8 ? 'text-red-600' :
+                            item.deepfake.ela_score > 4 ? 'text-amber-600' : 'text-green-600'
+                        }`}>{item.deepfake.ela_score}</span></span>
+                        <span>{item.deepfake.ela_score > 8 ? 'High — likely edited' : item.deepfake.ela_score > 4 ? 'Moderate' : 'Low'}</span>
+                    </div>
+                    <div className="w-full bg-slate-100 rounded-full h-1.5">
+                        <div
+                            className={`h-1.5 rounded-full ${
+                                item.deepfake.ela_score > 8 ? 'bg-red-500' :
+                                item.deepfake.ela_score > 4 ? 'bg-amber-500' : 'bg-green-500'
+                            }`}
+                            style={{ width: `${Math.min(100, item.deepfake.ela_score * 6)}%`, transition: 'width 0.8s ease' }}
+                        />
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+/* ── Main page ─────────────────────────────────────────────────────────────── */
 const DocumentDetection = ({ onBack }) => {
-    const [result, setResult] = useState(null);
+    const [result, setResult]   = useState(null);
     const [loading, setLoading] = useState(false);
-    const [error, setError] = useState(null);
+    const [error, setError]     = useState(null);
     const [fileName, setFileName] = useState(null);
 
     const onDrop = useCallback(async (acceptedFiles) => {
@@ -21,7 +100,7 @@ const DocumentDetection = ({ onBack }) => {
         formData.append('document', file);
 
         try {
-            const response = await fetch('http://localhost:8000/api/detect/document/', {
+            const response = await fetch(`${import.meta.env.VITE_API_URL}/api/detect/document/`, {
                 method: 'POST',
                 body: formData,
             });
@@ -48,11 +127,7 @@ const DocumentDetection = ({ onBack }) => {
         multiple: false,
     });
 
-    const reset = () => {
-        setResult(null);
-        setError(null);
-        setFileName(null);
-    };
+    const reset = () => { setResult(null); setError(null); setFileName(null); };
 
     return (
         <div className="min-h-screen bg-slate-50 font-sans text-slate-900">
@@ -63,10 +138,7 @@ const DocumentDetection = ({ onBack }) => {
                             <Shield className="w-8 h-8 text-blue-600" />
                             <span className="font-bold text-xl tracking-tight">DeepVerify — Document Scan</span>
                         </div>
-                        <button
-                            onClick={onBack}
-                            className="flex items-center gap-2 px-4 py-2 hover:bg-slate-100 rounded-lg transition text-sm font-medium"
-                        >
+                        <button onClick={onBack} className="flex items-center gap-2 px-4 py-2 hover:bg-slate-100 rounded-lg transition text-sm font-medium">
                             <ArrowLeft className="w-4 h-4" />
                             Back to Home
                         </button>
@@ -92,11 +164,10 @@ const DocumentDetection = ({ onBack }) => {
                 >
                     <input {...getInputProps()} />
                     <div className="flex flex-col items-center gap-4">
-                        {loading ? (
-                            <Loader2 className="w-12 h-12 text-blue-600 animate-spin" />
-                        ) : (
-                            <FileText className={`w-12 h-12 ${isDragActive ? 'text-blue-600' : 'text-slate-400'}`} />
-                        )}
+                        {loading
+                            ? <Loader2 className="w-12 h-12 text-blue-600 animate-spin" />
+                            : <FileText className={`w-12 h-12 ${isDragActive ? 'text-blue-600' : 'text-slate-400'}`} />
+                        }
                         <div className="text-center">
                             <p className="text-xl font-semibold">
                                 {isDragActive ? 'Drop document here' : 'Drag & drop a document'}
@@ -106,12 +177,12 @@ const DocumentDetection = ({ onBack }) => {
                     </div>
                 </div>
 
-                {/* Loading state */}
+                {/* Loading */}
                 {loading && (
                     <div className="p-6 bg-white rounded-2xl border border-slate-200 text-center shadow-sm">
                         <Loader2 className="w-8 h-8 text-blue-600 animate-spin mx-auto mb-3" />
-                        <p className="font-semibold animate-pulse">Extracting and analyzing images...</p>
-                        <p className="text-xs text-slate-400 mt-1">Multi-page PDFs may take a few seconds</p>
+                        <p className="font-semibold animate-pulse">Extracting faces and running forensic analysis…</p>
+                        <p className="text-xs text-slate-400 mt-1">Generating heatmap + ELA for each face found</p>
                     </div>
                 )}
 
@@ -127,14 +198,12 @@ const DocumentDetection = ({ onBack }) => {
                     <div className="space-y-4">
                         {/* Summary card */}
                         <div className={`p-6 rounded-2xl border-2 ${
-                            result.deepfakes_found > 0
-                                ? 'bg-red-50 border-red-200'
-                                : 'bg-green-50 border-green-200'
+                            result.deepfakes_found > 0 ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200'
                         }`}>
                             <div className="flex items-start gap-4">
                                 {result.deepfakes_found > 0
                                     ? <AlertTriangle className="w-8 h-8 text-red-600 shrink-0 mt-0.5" />
-                                    : <CheckCircle2 className="w-8 h-8 text-green-600 shrink-0 mt-0.5" />
+                                    : <CheckCircle2  className="w-8 h-8 text-green-600 shrink-0 mt-0.5" />
                                 }
                                 <div className="flex-1">
                                     <h2 className={`text-xl font-bold mb-1 ${result.deepfakes_found > 0 ? 'text-red-700' : 'text-green-700'}`}>
@@ -144,16 +213,12 @@ const DocumentDetection = ({ onBack }) => {
                                     </h2>
                                     <div className="flex flex-wrap gap-3 text-sm text-slate-500">
                                         <span className="flex items-center gap-1">
-                                            <FileImage className="w-4 h-4" />
-                                            {result.filename}
+                                            <FileImage className="w-4 h-4" />{result.filename}
                                         </span>
                                         <span>{result.total_analyzed} image{result.total_analyzed !== 1 ? 's' : ''} analyzed</span>
                                     </div>
                                 </div>
-                                <button
-                                    onClick={reset}
-                                    className="text-xs text-slate-400 hover:text-slate-600 underline shrink-0"
-                                >
+                                <button onClick={reset} className="text-xs text-slate-400 hover:text-slate-600 underline shrink-0">
                                     Scan another
                                 </button>
                             </div>
@@ -161,54 +226,57 @@ const DocumentDetection = ({ onBack }) => {
 
                         {/* Per-image breakdown */}
                         {result.results.length > 0 && (
-                            <div className="space-y-2">
-                                <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Image-by-image breakdown</h3>
-                                {result.results.map((item, i) => (
-                                    <div
-                                        key={i}
-                                        className={`p-4 rounded-xl border ${
-                                            item.overall === 'real'
-                                                ? 'bg-white border-slate-200'
-                                                : 'bg-red-50 border-red-200'
-                                        }`}
-                                    >
-                                        <div className="flex items-center justify-between mb-2">
-                                            <div className="flex items-center gap-2">
-                                                {item.overall === 'real'
-                                                    ? <CheckCircle2 className="w-4 h-4 text-green-500 shrink-0" />
-                                                    : <AlertTriangle className="w-4 h-4 text-red-500 shrink-0" />
-                                                }
-                                                <span className="text-sm font-medium text-slate-700">
-                                                    Page {item.page}, Image {item.index}
-                                                </span>
-                                                <span className={`text-xs font-bold uppercase px-2 py-0.5 rounded-full ${
-                                                    item.overall === 'real'
-                                                        ? 'bg-green-100 text-green-700'
-                                                        : 'bg-red-100 text-red-700'
-                                                }`}>
-                                                    {item.overall}
+                            <div className="space-y-3">
+                                <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                                    Image-by-image breakdown
+                                </h3>
+                                {result.results.map((item, i) => {
+                                    const isFake = item.overall === 'deepfake';
+                                    return (
+                                        <div
+                                            key={i}
+                                            className={`p-4 rounded-2xl border ${isFake ? 'bg-red-50 border-red-200' : 'bg-white border-slate-200'}`}
+                                        >
+                                            {/* Header row */}
+                                            <div className="flex items-center justify-between mb-2">
+                                                <div className="flex items-center gap-2">
+                                                    {isFake
+                                                        ? <AlertTriangle className="w-4 h-4 text-red-500 shrink-0" />
+                                                        : <CheckCircle2  className="w-4 h-4 text-green-500 shrink-0" />
+                                                    }
+                                                    <span className="text-sm font-medium text-slate-700">
+                                                        Page {item.page}, Image {item.index}
+                                                    </span>
+                                                    <span className={`text-xs font-bold uppercase px-2 py-0.5 rounded-full ${
+                                                        isFake ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'
+                                                    }`}>
+                                                        {item.overall}
+                                                    </span>
+                                                </div>
+                                                <span className="text-sm font-bold text-slate-600">
+                                                    {item.deepfake?.confidence}%
                                                 </span>
                                             </div>
-                                            <span className="text-sm font-bold text-slate-600">
-                                                {item.deepfake?.confidence}%
-                                            </span>
+
+                                            {/* Confidence bar */}
+                                            <div className="w-full bg-slate-100 rounded-full h-1.5 mb-3">
+                                                <div
+                                                    className={`h-1.5 rounded-full transition-all duration-700 ${isFake ? 'bg-red-500' : 'bg-green-500'}`}
+                                                    style={{ width: `${item.deepfake?.confidence}%` }}
+                                                />
+                                            </div>
+
+                                            {/* Face / Heatmap / ELA tabs */}
+                                            <VizTabs item={item} />
                                         </div>
-                                        <div className="w-full bg-slate-100 rounded-full h-1.5">
-                                            <div
-                                                className={`h-1.5 rounded-full transition-all duration-700 ${
-                                                    item.overall === 'real' ? 'bg-green-500' : 'bg-red-500'
-                                                }`}
-                                                style={{ width: `${item.deepfake?.confidence}%` }}
-                                            />
-                                        </div>
-                                    </div>
-                                ))}
+                                    );
+                                })}
                             </div>
                         )}
                     </div>
                 )}
 
-                {/* Empty state hint */}
+                {/* Empty state */}
                 {!result && !loading && !error && (
                     <div className="mt-4 text-center text-slate-400 text-sm">
                         <p>Upload a document to begin analysis. All processing is done locally — nothing is stored.</p>

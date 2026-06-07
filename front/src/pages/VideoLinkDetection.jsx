@@ -59,7 +59,7 @@ const VideoLinkDetection = ({ onBack }) => {
         abortRef.current = controller;
 
         try {
-            const res = await fetch('http://localhost:8000/api/detect/video/', {
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/api/detect/video/`, {
                 method:  'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body:    JSON.stringify({ url: url.trim() }),

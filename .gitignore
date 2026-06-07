@@ -6,12 +6,12 @@ __pycache__/
 # Virtual environment
 backend/venv/
 
-# Model weights — too large for GitHub (use Git LFS or store separately)
-*.pt
-*.pth
-*.bin
-*.ckpt
+# Large model weights — hosted on HuggingFace Hub, downloaded at startup
+backend/detector_best.pt
+backend/detector/best_voice_model.pt
+# Large CLIP model cache (auto-downloaded by transformers/clip)
 *.safetensors
+*.ckpt
 
 # Django
 backend/db.sqlite3

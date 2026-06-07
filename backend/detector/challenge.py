@@ -20,7 +20,7 @@ from PIL import Image
 from io import BytesIO
 
 TOKEN_TTL_SECONDS = 180           # 3 minutes
-MOTION_THRESHOLD  = 12.0         # mean absolute pixel diff (0-255 scale) per channel
+MOTION_THRESHOLD  = 3.0          # mean absolute pixel diff (0-255 scale) per channel
 IDENTICAL_THRESHOLD = 1.5        # diffs below this = same image submitted twice
 
 

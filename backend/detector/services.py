@@ -6,6 +6,7 @@ import torch
 import torch._dynamo
 torch._dynamo.config.disable = True
 import io
+import os
 import base64
 
 import fitz   # PyMuPDF
@@ -207,6 +208,610 @@ def extract_exif_signals(image: Image.Image) -> dict:
     return result
 
 
+# ── Geometry / shadow consistency check ──────────────────────────────────────
+
+def check_geometry_consistency(image: Image.Image) -> dict:
+    """
+    Estimate whether perspective and shadow cues are internally consistent.
+
+    Two signals:
+      1. Shadow gradient variance — cast shadows across the scene should all
+         point in roughly the same direction (one dominant light source).
+         High circular variance of gradient angles in dark regions → suspicious.
+
+      2. Face vs scene lighting asymmetry — brightness left/right asymmetry of
+         the face should agree in sign with the background's asymmetry.
+         A face lit from the left inside a right-lit scene → suspicious.
+
+    Adjustment range: [0.0, +0.12]
+      High shadow variance  → up to +0.08
+      Face/scene mismatch   → +0.07
+      (capped at 0.12 total to avoid over-penalising)
+    """
+    result: dict = {
+        "shadow_variance":        None,
+        "face_bg_lighting_delta": None,
+        "adjustment":             0.0,
+        "signals":                [],
+    }
+
+    try:
+        import cv2
+    except ImportError:
+        return result
+
+    try:
+        img_np = np.array(image.convert("RGB"))
+        gray   = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        h, w   = gray.shape
+
+        # ── 1. Shadow direction consistency ──────────────────────────────────
+        gx  = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy  = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        mag = np.sqrt(gx ** 2 + gy ** 2)
+        ang = np.arctan2(gy, gx)
+
+        # Shadow edges: dark regions with a detectable intensity boundary
+        shadow_angles = ang[(gray < 90) & (mag > 15)]
+
+        if shadow_angles.size > 300:
+            sin_m    = np.mean(np.sin(shadow_angles))
+            cos_m    = np.mean(np.cos(shadow_angles))
+            variance = 1.0 - float(np.sqrt(sin_m ** 2 + cos_m ** 2))
+            result["shadow_variance"] = round(variance, 3)
+
+            if variance > 0.92:
+                result["adjustment"] += 0.08
+                result["signals"].append(
+                    f"Shadow directions highly inconsistent (variance {variance:.2f}) — "
+                    "possible composited elements from different light sources"
+                )
+            elif variance > 0.82:
+                result["adjustment"] += 0.03
+                result["signals"].append(
+                    f"Moderate shadow direction inconsistency (variance {variance:.2f})"
+                )
+
+        # ── 2. Face lighting vs scene lighting ────────────────────────────────
+        mtcnn = _get_mtcnn()
+        with torch.no_grad():
+            boxes, _, _ = mtcnn.detect(image.convert("RGB"), landmarks=True)
+
+        if boxes is not None and len(boxes) > 0:
+            bx1 = max(0, int(boxes[0][0]))
+            by1 = max(0, int(boxes[0][1]))
+            bx2 = min(w, int(boxes[0][2]))
+            by2 = min(h, int(boxes[0][3]))
+            fw, fh = bx2 - bx1, by2 - by1
+
+            if fw > 20 and fh > 20:
+                face_crop = gray[by1:by2, bx1:bx2]
+
+                # Lateral brightness asymmetry: positive = right side brighter → lit from right
+                face_dir = float(np.mean(face_crop[:, fw // 2:])) - float(np.mean(face_crop[:, :fw // 2]))
+
+                # Background: full image left vs right, with face column zeroed out
+                bg = gray.astype(np.float64)
+                bg[by1:by2, bx1:bx2] = np.nan
+                bg_dir = float(np.nanmean(bg[:, w // 2:])) - float(np.nanmean(bg[:, :w // 2]))
+
+                # Flag only when both regions show non-trivial asymmetry and disagree in sign
+                if abs(face_dir) > 6 and abs(bg_dir) > 4 and np.sign(face_dir) != np.sign(bg_dir):
+                    delta = abs(face_dir - bg_dir)
+                    result["face_bg_lighting_delta"] = round(delta, 1)
+                    result["adjustment"] += 0.07
+                    result["signals"].append(
+                        f"Face lighting direction conflicts with scene lighting "
+                        f"(face Δ{face_dir:+.1f}, scene Δ{bg_dir:+.1f}) — possible face composite"
+                    )
+                else:
+                    result["face_bg_lighting_delta"] = 0.0
+
+        result["adjustment"] = float(np.clip(result["adjustment"], 0.0, 0.12))
+
+    except Exception:
+        pass
+
+    return result
+
+
+# ── Hany Farid-inspired forensic signals ─────────────────────────────────────
+
+def check_forensic_signals(image: Image.Image) -> dict:
+    """
+    Three forensic checks inspired by Hany Farid's digital-forensics research.
+
+      1. Chromatic aberration (CA) — real camera lenses produce colour fringing
+         that increases toward the image periphery. AI/composite images either
+         have near-zero CA (too perfect) or show the wrong radial pattern.
+
+      2. Local noise inconsistency — a genuine camera image has spatially
+         uniform sensor noise. Composited images show abrupt changes in noise
+         level between regions sourced from different originals.
+
+      3. Eye specular highlight symmetry — both eyes are illuminated by the same
+         environment, so the bright specular spot should appear at the same
+         relative position in each eye. A large positional mismatch is a strong
+         indicator that the face was composited from a different photo.
+
+    Adjustment range: [0.0, +0.10]
+    """
+    result: dict = {
+        "ca_score":            None,
+        "noise_cv":            None,
+        "eye_highlight_delta": None,
+        "adjustment":          0.0,
+        "signals":             [],
+    }
+
+    try:
+        import cv2
+    except ImportError:
+        return result
+
+    try:
+        img_np = np.array(image.convert("RGB"))
+        r = img_np[:, :, 0].astype(np.float32)
+        b = img_np[:, :, 2].astype(np.float32)
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        h, w = gray.shape
+
+        # ── 1. Chromatic aberration: peripheral vs central CA level ──────────
+        if min(h, w) >= 80:
+            gx  = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            gy  = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            mag = np.sqrt(gx ** 2 + gy ** 2)
+
+            edge_mask = mag > np.percentile(mag, 85)
+            ys, xs = np.mgrid[0:h, 0:w]
+            dist   = np.sqrt(((ys - h / 2) / h) ** 2 + ((xs - w / 2) / w) ** 2)
+
+            center_mask = (dist < 0.30) & edge_mask
+            periph_mask = (dist > 0.42) & edge_mask
+
+            if center_mask.sum() > 50 and periph_mask.sum() > 50:
+                ca_center = float(np.mean(np.abs(r[center_mask] - b[center_mask])))
+                ca_periph = float(np.mean(np.abs(r[periph_mask] - b[periph_mask])))
+                ca_ratio  = ca_periph / (ca_center + 1e-8)
+                result["ca_score"] = round(ca_ratio, 2)
+
+                if ca_ratio < 0.5 and ca_center < 3.0:
+                    # CA decreasing toward periphery — opposite of real optics
+                    result["adjustment"] += 0.05
+                    result["signals"].append(
+                        f"Chromatic aberration is lower at image periphery than centre "
+                        f"(ratio {ca_ratio:.2f}) — inconsistent with real lens optics"
+                    )
+                elif ca_center < 1.0 and ca_periph < 1.0:
+                    # Essentially zero CA — characteristic of AI-generated images
+                    result["adjustment"] += 0.03
+                    result["signals"].append(
+                        "Near-zero chromatic aberration across the whole image — "
+                        "real camera lenses always produce some colour fringing"
+                    )
+
+        # ── 2. Local noise inconsistency ─────────────────────────────────────
+        block = 64
+        noise_levels: list[float] = []
+        for y in range(0, h - block + 1, block):
+            for x in range(0, w - block + 1, block):
+                patch = gray[y : y + block, x : x + block]
+                lap   = cv2.Laplacian(patch, cv2.CV_64F)
+                noise_levels.append(float(np.median(np.abs(lap))))
+
+        if len(noise_levels) >= 4:
+            mean_n = float(np.mean(noise_levels))
+            cv_n   = float(np.std(noise_levels) / (mean_n + 1e-8))
+            result["noise_cv"] = round(cv_n, 3)
+
+            if cv_n > 1.2:
+                result["adjustment"] += 0.06
+                result["signals"].append(
+                    f"Noise level varies greatly across image regions (CV {cv_n:.2f}) — "
+                    "suggests different source materials composited together"
+                )
+            elif cv_n > 0.90:
+                result["adjustment"] += 0.02
+                result["signals"].append(
+                    f"Moderate spatial noise inconsistency (CV {cv_n:.2f})"
+                )
+
+        # ── 3. Eye specular highlight symmetry ───────────────────────────────
+        mtcnn = _get_mtcnn()
+        with torch.no_grad():
+            _, _, landmarks = mtcnn.detect(image.convert("RGB"), landmarks=True)
+
+        if landmarks is not None and len(landmarks) > 0:
+            lm       = landmarks[0]       # (5, 2): L-eye, R-eye, nose, L-mouth, R-mouth
+            eye_half = 18
+            highlights: list[tuple[float, float]] = []
+
+            for eye_xy in (lm[0], lm[1]):
+                ex, ey = int(eye_xy[0]), int(eye_xy[1])
+                x1 = max(0, ex - eye_half); x2 = min(w, ex + eye_half)
+                y1 = max(0, ey - eye_half); y2 = min(h, ey + eye_half)
+                patch = gray[y1:y2, x1:x2]
+                if patch.size == 0:
+                    continue
+                ph, pw = patch.shape
+                hy, hx = np.unravel_index(int(np.argmax(patch)), patch.shape)
+                highlights.append((hx / pw, hy / ph))   # normalised [0..1]
+
+            if len(highlights) == 2:
+                dx = abs(highlights[0][0] - highlights[1][0])
+                dy = abs(highlights[0][1] - highlights[1][1])
+                mismatch = float(np.sqrt(dx ** 2 + dy ** 2))
+                result["eye_highlight_delta"] = round(mismatch, 3)
+
+                if mismatch > 0.55:
+                    result["adjustment"] += 0.08
+                    result["signals"].append(
+                        f"Eye specular highlights mismatched (Δ{mismatch:.2f}) — "
+                        "both eyes should reflect the same light source; "
+                        "strong indicator of face compositing"
+                    )
+                elif mismatch > 0.35:
+                    result["adjustment"] += 0.03
+                    result["signals"].append(
+                        f"Eye specular highlights partially mismatched (Δ{mismatch:.2f})"
+                    )
+
+        result["adjustment"] = float(np.clip(result["adjustment"], 0.0, 0.10))
+
+    except Exception:
+        pass
+
+    return result
+
+
+# ── Error Level Analysis ──────────────────────────────────────────────────────
+
+def compute_ela(image: Image.Image, quality: int = 90) -> tuple[str | None, float]:
+    """
+    Re-save the image at a fixed JPEG quality, then amplify the per-pixel
+    difference.  Regions that were previously edited (saved at a different
+    quality, pasted from another source, or AI-inpainted) retain a different
+    DCT quantisation pattern and show up as bright hotspots.
+
+    Returns (base64-encoded overlay image, mean ELA score 0-255).
+    Score > ~8 on an uncompressed PNG suggests prior manipulation.
+    """
+    try:
+        import cv2
+
+        orig_rgb = image.convert("RGB")
+        buf = io.BytesIO()
+        orig_rgb.save(buf, format="JPEG", quality=quality)
+        buf.seek(0)
+        resaved = Image.open(buf).convert("RGB")
+
+        orig_arr    = np.array(orig_rgb,  dtype=np.float32)
+        resaved_arr = np.array(resaved,   dtype=np.float32)
+
+        diff      = np.abs(orig_arr - resaved_arr)
+        ela_score = float(np.mean(diff))
+
+        # Amplify 15× then apply JET colourmap for visibility
+        gray     = np.clip(np.mean(diff, axis=2) * 15, 0, 255).astype(np.uint8)
+        coloured = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+        col_rgb  = cv2.cvtColor(coloured, cv2.COLOR_BGR2RGB)
+
+        orig_u8 = np.array(orig_rgb, dtype=np.uint8)
+        blended = np.uint8(0.40 * orig_u8 + 0.60 * col_rgb)
+
+        buf2 = io.BytesIO()
+        Image.fromarray(blended).save(buf2, format="JPEG", quality=85)
+        b64 = "data:image/jpeg;base64," + base64.b64encode(buf2.getvalue()).decode()
+        return b64, ela_score
+
+    except Exception as e:
+        print(f"[ELA] {e}")
+        return None, 0.0
+
+
+# ── Generator / provenance attribution ───────────────────────────────────────
+
+# IPTC DigitalSourceType values that declare AI generation (Rec. G7-2021)
+_IPTC_AI_VALUES = {
+    "trainedalgorithamicmedia": "Trained Algorithmic Media (IPTC)",
+    "trainedalgorithmicmedia":  "Trained Algorithmic Media (IPTC)",
+    "compositecapture":         "Composite Capture (IPTC)",
+    "algorithmicmedia":         "Algorithmic Media (IPTC)",
+}
+
+# XMP / raw-binary patterns → generator name
+_GENERATOR_PATTERNS: list[tuple[bytes, str]] = [
+    (b"openai",           "DALL-E / OpenAI"),
+    (b"dall-e",           "DALL-E / OpenAI"),
+    (b"dalle",            "DALL-E / OpenAI"),
+    (b"midjourney",       "Midjourney"),
+    (b"stable-diffusion", "Stable Diffusion"),
+    (b"stablediffusion",  "Stable Diffusion"),
+    (b"stable_diffusion", "Stable Diffusion"),
+    (b"comfyui",          "ComfyUI (Stable Diffusion)"),
+    (b"automatic1111",    "AUTOMATIC1111 (Stable Diffusion)"),
+    (b"a1111",            "AUTOMATIC1111 (Stable Diffusion)"),
+    (b"invokeai",         "InvokeAI (Stable Diffusion)"),
+    (b"novelai",          "NovelAI"),
+    (b"fooocus",          "Fooocus (Stable Diffusion)"),
+    (b"adobe firefly",    "Adobe Firefly"),
+    (b"firefly",          "Adobe Firefly"),
+    (b"google imagen",    "Google Imagen"),
+    (b"imagen",           "Google Imagen"),
+    (b"gemini",           "Google Gemini"),
+    (b"leonardo.ai",      "Leonardo AI"),
+    (b"dreamshaper",      "DreamShaper (Stable Diffusion)"),
+    (b"playground ai",    "Playground AI"),
+    (b"nightcafe",        "NightCafe"),
+    (b"tensor.art",       "Tensor.Art"),
+    (b"truepic",          "Truepic (camera-authenticated)"),
+    (b"leica",            "Leica Camera (authentic)"),
+]
+
+
+def extract_provenance_signals(image_bytes: bytes) -> dict:
+    """
+    Deep provenance scan: C2PA manifest, IPTC DigitalSourceType, XMP
+    CreatorTool, and raw binary generator strings in the first 128 KB.
+
+    Confidence levels:
+      "definitive" — cryptographic C2PA manifest or explicit IPTC AI tag
+      "high"       — CreatorTool / XMP field names the generator directly
+      "medium"     — generator string found in raw binary metadata
+      "none"       — nothing found
+
+    Score impact (applied in combined_predict):
+      override = True  → fake_prob forced to 1.0 regardless of ML score.
+                         Triggered by IPTC AI declaration or C2PA + known AI tool.
+                         Metadata is cryptographic — it cannot be wrong.
+      adjustment       → additive delta when override is False:
+                         known AI generator (high conf) → +0.25
+                         known AI generator (medium)    → +0.12
+                         authentic camera (Leica/Truepic) → −0.10
+    """
+    # Camera-authenticated generators — these increase authenticity, not fakeness
+    _CAMERA_GENERATORS = {b"leica", b"truepic"}
+
+    result: dict = {
+        "generator":   None,
+        "confidence":  "none",
+        "has_c2pa":    False,
+        "has_iptc_ai": False,
+        "override":    False,   # True → force verdict to deepfake
+        "adjustment":  0.0,     # additive score delta when override is False
+        "signals":     [],
+    }
+
+    try:
+        # ── C2PA JUMBF (JPEG APP11 = 0xFFEB, labelled "c2pa") ────────────────
+        head = image_bytes[:65536]
+        if b"\xff\xeb" in image_bytes and b"c2pa" in head:
+            result["has_c2pa"]   = True
+            result["confidence"] = "definitive"
+            result["signals"].append(
+                "C2PA Content Credentials present — cryptographically signed provenance manifest"
+            )
+            head_lower = head.lower()
+            for pat, name in _GENERATOR_PATTERNS:
+                if pat in head_lower:
+                    result["generator"] = name
+                    # Camera-authenticated sources are real, not AI
+                    if any(cam in pat for cam in _CAMERA_GENERATORS):
+                        result["adjustment"] = -0.10
+                    else:
+                        result["override"] = True   # C2PA + known AI tool = definitive fake
+                    break
+            if not result["generator"]:
+                result["generator"] = "C2PA-compliant tool (generator not identified in manifest)"
+
+        # ── XMP / IPTC metadata ───────────────────────────────────────────────
+        import re
+        pil     = Image.open(io.BytesIO(image_bytes))
+        xmp_raw = pil.info.get("xmp", b"")
+        if isinstance(xmp_raw, str):
+            xmp_raw = xmp_raw.encode("utf-8", errors="ignore")
+        xmp = xmp_raw.decode("utf-8", errors="ignore") if xmp_raw else ""
+        xl  = xmp.lower()
+
+        if xl:
+            # IPTC DigitalSourceType — explicit AI declaration in the standard
+            for iptc_val, label in _IPTC_AI_VALUES.items():
+                if iptc_val in xl:
+                    result["has_iptc_ai"] = True
+                    result["confidence"]  = "definitive"
+                    result["override"]    = True   # IPTC tag = definitively AI-generated
+                    result["signals"].append(f"IPTC DigitalSourceType = {label} — declared AI-generated")
+                    break
+
+            # Parse DigitalSourceType value for display
+            m = re.search(r"digitalsourcetype[^>]*?>([^<]+)<", xmp, re.IGNORECASE)
+            if m:
+                dst = m.group(1).strip().split("/")[-1]
+                result["signals"].append(f"IPTC DigitalSourceType: {dst}")
+
+            # XMP CreatorTool
+            m = re.search(r"creatortool[^>]*?>([^<]+)<", xmp, re.IGNORECASE)
+            if m:
+                tool     = m.group(1).strip()
+                tool_low = tool.lower().encode()
+                result["signals"].append(f"XMP CreatorTool: {tool}")
+                if result["confidence"] in ("none", "medium"):
+                    for pat, name in _GENERATOR_PATTERNS:
+                        if pat in tool_low:
+                            result["generator"] = name
+                            result["confidence"] = "high"
+                            if not any(cam in pat for cam in _CAMERA_GENERATORS):
+                                result["adjustment"] = max(result["adjustment"], 0.25)
+                            break
+
+            # CAI / C2PA in XMP namespace
+            if "cai:" in xl or "c2pa" in xl:
+                result["has_c2pa"] = True
+                if result["confidence"] == "none":
+                    result["confidence"] = "high"
+                result["signals"].append("Content Authenticity Initiative (CAI) XMP namespace present")
+
+        # ── Raw binary scan of first 128 KB ──────────────────────────────────
+        raw_low = image_bytes[:131072].lower()
+        if result["confidence"] in ("none",) and not result["generator"]:
+            for pat, name in _GENERATOR_PATTERNS:
+                if pat in raw_low:
+                    result["generator"] = name
+                    result["confidence"] = "medium"
+                    result["signals"].append(f"Generator string found in file binary: {name}")
+                    if not any(cam in pat for cam in _CAMERA_GENERATORS):
+                        result["adjustment"] = max(result["adjustment"], 0.12)
+                    break
+
+    except Exception as e:
+        print(f"[provenance] {e}")
+
+    # Safety net: has_iptc_ai always implies override, regardless of which
+    # code path set it (catches any edge-case ordering issues above).
+    if result["has_iptc_ai"]:
+        result["override"] = True
+
+    return result
+
+
+# ── Partial face manipulation detection ──────────────────────────────────────
+
+def check_partial_manipulation(image: Image.Image) -> dict:
+    """
+    Score the upper face (eyes + forehead) and lower face (nose + mouth + chin)
+    independently.  A large discrepancy between the two halves suggests a
+    partial swap — e.g. mouth replacement (Wav2Lip / DeepFaceLab), eye
+    replacement, or inpainted lower face.
+
+    Adjustment range: [0.0, +0.08]
+    """
+    result: dict = {
+        "upper_score":  None,
+        "lower_score":  None,
+        "discrepancy":  None,
+        "adjustment":   0.0,
+        "signals":      [],
+    }
+
+    try:
+        mtcnn = _get_mtcnn()
+        with torch.no_grad():
+            boxes, _, landmarks = mtcnn.detect(image.convert("RGB"), landmarks=True)
+
+        if boxes is None or len(boxes) == 0:
+            return result
+
+        box = boxes[0]
+        lm  = landmarks[0]   # (5, 2): L-eye, R-eye, nose, L-mouth, R-mouth
+
+        iw, ih = image.size
+        x1 = max(0, int(box[0]))
+        y1 = max(0, int(box[1]))
+        x2 = min(iw, int(box[2]))
+        y2 = min(ih, int(box[3]))
+        fh = y2 - y1
+
+        if fh < 40:
+            return result
+
+        # Split at the nose tip, but keep each half at least ¼ of face height
+        nose_y  = int(lm[2][1])
+        split_y = int(np.clip(nose_y, y1 + fh // 4, y2 - fh // 4))
+
+        detector    = get_detector()
+        upper_crop  = image.crop((x1, y1, x2, split_y)).resize((224, 224))
+        lower_crop  = image.crop((x1, split_y, x2, y2)).resize((224, 224))
+
+        upper_score = round(detector.predict(upper_crop)["fake_prob"] * 100, 1)
+        lower_score = round(detector.predict(lower_crop)["fake_prob"] * 100, 1)
+        discrepancy = round(abs(upper_score - lower_score), 1)
+
+        result["upper_score"] = upper_score
+        result["lower_score"] = lower_score
+        result["discrepancy"] = discrepancy
+
+        if discrepancy > 25:
+            result["adjustment"] += 0.08
+            worse = "Upper" if upper_score > lower_score else "Lower"
+            result["signals"].append(
+                f"Large score gap between face halves ({discrepancy:.0f}pt) — "
+                f"{worse} face is much more suspicious; possible partial face swap"
+            )
+        elif discrepancy > 15:
+            result["adjustment"] += 0.04
+            result["signals"].append(
+                f"Moderate face-half discrepancy ({discrepancy:.0f}pt) — "
+                "upper and lower regions scored differently"
+            )
+
+        result["adjustment"] = float(np.clip(result["adjustment"], 0.0, 0.08))
+
+    except Exception:
+        pass
+
+    return result
+
+
+# ── Multi-face analysis ───────────────────────────────────────────────────────
+
+_mtcnn_all = None
+
+
+def _get_mtcnn_all():
+    global _mtcnn_all
+    if _mtcnn_all is None:
+        _mtcnn_all = MTCNN(keep_all=True, post_process=False, device="cpu")
+    return _mtcnn_all
+
+
+def analyze_all_faces(image: Image.Image) -> list[dict]:
+    """
+    Detect every face in the image and run the deepfake detector on each.
+    Returns a list sorted by face size (largest first).
+    Only called for static image uploads (not live/video frames).
+    """
+    results: list[dict] = []
+    try:
+        mtcnn = _get_mtcnn_all()
+        with torch.no_grad():
+            boxes, probs, _ = mtcnn.detect(image.convert("RGB"), landmarks=True)
+
+        if boxes is None:
+            return results
+
+        iw, ih   = image.size
+        detector = get_detector()
+        margin   = 30
+
+        for i, (box, conf) in enumerate(zip(boxes, probs)):
+            if float(conf) < 0.85:
+                continue
+            x1 = max(0, int(box[0]) - margin)
+            y1 = max(0, int(box[1]) - margin)
+            x2 = min(iw, int(box[2]) + margin)
+            y2 = min(ih, int(box[3]) + margin)
+
+            face_crop = image.crop((x1, y1, x2, y2))
+            pred      = detector.predict(face_crop)
+
+            results.append({
+                "face_index":   i + 1,
+                "bbox":         [x1, y1, x2, y2],
+                "det_conf":     round(float(conf) * 100, 1),
+                "fake_prob":    round(pred["fake_prob"] * 100, 1),
+                "prediction":   pred["prediction"],
+                "confidence":   round(pred["confidence"], 1),
+            })
+
+        # Sort by face area descending
+        results.sort(key=lambda r: (r["bbox"][2]-r["bbox"][0]) * (r["bbox"][3]-r["bbox"][1]), reverse=True)
+
+    except Exception:
+        pass
+
+    return results
+
+
 # ── CLIP detector singleton ───────────────────────────────────────────────────
 
 _detector = None
@@ -300,6 +905,69 @@ def generate_heatmap(face_image: Image.Image) -> str | None:
         return None
 
 
+# ── UniversalFakeDetect (CLIP ViT-L/14 + linear probe) ───────────────────────
+
+class UniversalFakeDetector:
+    """
+    Wang et al. "Towards Universal Fake Image Detection by Exploiting the
+    Artefacts of Generative Models" — CVPR 2023.
+    Uses CLIP ViT-L/14 features + a linear probe trained on diverse GAN/diffusion
+    outputs (ProGAN, StyleGAN, DALL-E, Stable Diffusion, etc.).
+    Weights file: backend/detector/ufd_fc_weights.pth
+    Download from https://github.com/Yuheng-Li/UniversalFakeDetect (see README).
+    """
+    _instance = None
+    _available = False
+
+    WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "ufd_fc_weights.pth")
+
+    def __new__(cls):
+        if cls._instance is None:
+            obj = super().__new__(cls)
+            obj._loaded = False
+            try:
+                import clip as clip_lib
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                obj.device = device
+                obj.clip_model, obj.preprocess = clip_lib.load("ViT-L/14", device=device)
+                obj.clip_model.eval()
+                obj.fc = torch.nn.Linear(768, 1).to(device)
+                if os.path.exists(cls.WEIGHTS_PATH):
+                    state = torch.load(cls.WEIGHTS_PATH, map_location=device)
+                    # Handle both raw state_dict and wrapped checkpoints
+                    if isinstance(state, dict) and "fc." in str(list(state.keys())):
+                        # wrapped: strip prefix
+                        state = {k.replace("fc.", ""): v for k, v in state.items()}
+                    obj.fc.load_state_dict(state)
+                    obj.fc.eval()
+                    obj._loaded = True
+                    cls._available = True
+                    print("[UFD] UniversalFakeDetect loaded ✓")
+                else:
+                    print(f"[UFD] Weights not found at {cls.WEIGHTS_PATH} — UFD disabled")
+            except Exception as e:
+                print(f"[UFD] Failed to initialise: {e}")
+            cls._instance = obj
+        return cls._instance
+
+    def predict(self, image: "Image.Image") -> dict:
+        """Returns fake_prob in [0,1]. Returns None if model not loaded."""
+        if not self._loaded:
+            return None
+        try:
+            import clip as clip_lib
+            inp = self.preprocess(image).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                feat = self.clip_model.encode_image(inp).float()
+                feat = feat / feat.norm(dim=-1, keepdim=True)
+                logit = self.fc(feat).squeeze()
+                prob = torch.sigmoid(logit).item()
+            return {"fake_prob": round(prob, 4)}
+        except Exception as e:
+            print(f"[UFD] predict error: {e}")
+            return None
+
+
 # ── Anti-spoofing / liveness model ───────────────────────────────────────────
 
 class LivenessModel:
@@ -319,9 +987,9 @@ class LivenessModel:
             cls._instance = obj
         return cls._instance
 
-    # Raised from 0.80 → 0.92: genuine video-replay spoofs score >0.92;
-    # lower values catch motion-blurred webcam frames as false positives.
-    SPOOF_THRESHOLD = 0.92
+    # 0.97: genuine screen/photo replays score ≥0.98; webcam false positives
+    # (dim light, partial angle) typically land 0.90–0.96.
+    SPOOF_THRESHOLD = 0.97
 
     def predict(self, image_file):
         image = Image.open(image_file).convert("RGB")
@@ -342,53 +1010,103 @@ class LivenessModel:
 
 def combined_predict(image_file, live=False, explain=False):
     """
-    Full detection pipeline — CLIP ViT-B/16 + LoRA + EXIF correction.
-    Returns the same JSON shape as before so the frontend needs no changes.
+    Full detection pipeline — CLIP ViT-B/16 + LoRA + all side signals.
     """
     image_bytes = image_file.read()
     pil_image   = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    # Face alignment then CLIP inference
+    # Face alignment then CLIP+LoRA inference
     aligned  = _crop_and_align_face(pil_image)
     detector = get_detector()
     result   = detector.predict(aligned)
-    raw_prob = result['fake_prob']
+    lora_prob = result["fake_prob"]
 
-    # EXIF metadata: kept as a side signal, applies a small score correction
-    meta      = extract_exif_signals(pil_image)
-    fake_prob = float(np.clip(raw_prob + meta["adjustment"], 0.0, 1.0))
+    # UniversalFakeDetect ensemble (CLIP ViT-L/14 trained on GAN+diffusion fakes)
+    ufd       = UniversalFakeDetector()
+    ufd_result = ufd.predict(pil_image)
+    if ufd_result is not None:
+        # Take the MAX: if either model is highly confident it's fake, respect that.
+        # Averaging was wrong — UFD dragged down a 94% LoRA signal to below threshold.
+        raw_prob = float(np.clip(max(lora_prob, ufd_result["fake_prob"]), 0.0, 1.0))
+    else:
+        raw_prob = lora_prob
 
-    threshold  = detector.threshold
-    final_pred = "fake" if fake_prob >= threshold else "real"
-    confidence = round(fake_prob * 100 if final_pred == "fake" else (1 - fake_prob) * 100, 2)
+    # Side signals — each applies a small score correction
+    meta       = extract_exif_signals(pil_image)
+    geo        = check_geometry_consistency(pil_image)
+    forensic   = check_forensic_signals(pil_image)
+    partial    = check_partial_manipulation(pil_image)
+    provenance = extract_provenance_signals(image_bytes)
 
-    overall = "deepfake" if final_pred == "fake" else "real"
+    threshold = detector.threshold
 
-    # ml_score = raw CLIP output; fft_score removed (no FFT in new pipeline)
+    if provenance["override"]:
+        # Metadata is cryptographic evidence — it overrides the ML score entirely.
+        # IPTC TrainedAlgorithmicMedia or C2PA + identified AI tool = definitively fake.
+        fake_prob  = 1.0
+        final_pred = "fake"
+        confidence = 100.0
+        overall    = "deepfake"
+    else:
+        fake_prob = float(np.clip(
+            raw_prob
+            + meta["adjustment"]
+            + geo["adjustment"]
+            + forensic["adjustment"]
+            + partial["adjustment"]
+            + provenance["adjustment"],
+            0.0, 1.0,
+        ))
+        final_pred = "fake" if fake_prob >= threshold else "real"
+        confidence = round(fake_prob * 100 if final_pred == "fake" else (1 - fake_prob) * 100, 2)
+        overall    = "deepfake" if final_pred == "fake" else "real"
+
     analysis = {
-        "ml_score":        round(raw_prob          * 100, 1),
-        "fft_score":       None,
-        "meta_adjustment": round(meta["adjustment"] * 100, 1),
-        "final_score":     round(fake_prob          * 100, 1),
-        "threshold":       round(threshold          * 100, 1),
+        "ml_score":              round(lora_prob                   * 100, 1),
+        "ufd_score":             round(ufd_result["fake_prob"] * 100, 1) if ufd_result else None,
+        "fft_score":             None,
+        "meta_adjustment":       round(meta["adjustment"]          * 100, 1),
+        "geo_adjustment":        round(geo["adjustment"]           * 100, 1),
+        "forensic_adjustment":   round(forensic["adjustment"]      * 100, 1),
+        "partial_adjustment":    round(partial["adjustment"]       * 100, 1),
+        "provenance_adjustment": round(provenance["adjustment"]    * 100, 1),
+        "provenance_override":   provenance["override"],
+        "final_score":           round(fake_prob                   * 100, 1),
+        "threshold":             round(threshold                   * 100, 1),
     }
 
+    # Multi-face: only for static uploads (not live frames) to keep latency low
+    faces = analyze_all_faces(pil_image) if not live else []
+
     response = {
-        "overall":  overall,
-        "deepfake": {"prediction": final_pred, "confidence": confidence},
-        "metadata": meta,
-        "analysis": analysis,
+        "overall":    overall,
+        "deepfake":   {"prediction": final_pred, "confidence": confidence},
+        "metadata":   meta,
+        "provenance": provenance,
+        "geometry":   geo,
+        "forensic":   forensic,
+        "partial":    partial,
+        "faces":      faces,
+        "analysis":   analysis,
     }
 
     if live:
         liveness_result = LivenessModel().predict(io.BytesIO(image_bytes))
-        if liveness_result["prediction"] == "spoof":
+        spoof_conf = liveness_result.get("confidence", 0) / 100.0
+        # Require BOTH high spoof confidence AND the ML model not being
+        # strongly convinced the face is real (raw_prob > 0.35).
+        # This prevents dim-lighting / partial-angle false positives from
+        # overriding a clearly-real ML verdict.
+        if liveness_result["prediction"] == "spoof" and (raw_prob > 0.35 or spoof_conf >= 0.99):
             overall = "deepfake"
         response["overall"]  = overall
         response["liveness"] = liveness_result
 
     if explain:
         response["heatmap"] = generate_heatmap(aligned)
+        ela_b64, ela_score  = compute_ela(pil_image)
+        response["ela_map"]   = ela_b64
+        response["ela_score"] = round(ela_score, 2)
 
     return response
 
@@ -396,15 +1114,42 @@ def combined_predict(image_file, live=False, explain=False):
 # ── Document detection ────────────────────────────────────────────────────────
 
 def _run_ensemble_on_pil(image: Image.Image) -> dict:
-    """Run CLIP detector on a PIL Image (used by the document pipeline)."""
+    """
+    Run CLIP detector on a PIL Image (used by the document pipeline).
+    Also generates GradCAM heatmap, ELA map, and returns the aligned face crop
+    so the frontend can show the same visualisations as the main image detector.
+    """
     aligned   = _crop_and_align_face(image)
     detector  = get_detector()
     result    = detector.predict(aligned)
-    fake_prob = result['fake_prob']
+    fake_prob = result["fake_prob"]
     threshold = detector.threshold
     normalized = "fake" if fake_prob >= threshold else "real"
     confidence = round(fake_prob * 100 if normalized == "fake" else (1 - fake_prob) * 100, 2)
-    return {"prediction": normalized, "confidence": confidence}
+
+    # Face crop as base64 so the frontend can display the extracted face
+    face_b64: str | None = None
+    try:
+        buf = io.BytesIO()
+        aligned.convert("RGB").resize((224, 224)).save(buf, format="JPEG", quality=85)
+        face_b64 = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        pass
+
+    # GradCAM heatmap on the aligned face
+    heatmap = generate_heatmap(aligned)
+
+    # ELA on the original extracted image (not the face crop)
+    ela_b64, ela_score = compute_ela(image)
+
+    return {
+        "prediction": normalized,
+        "confidence": confidence,
+        "face_crop":  face_b64,
+        "heatmap":    heatmap,
+        "ela_map":    ela_b64,
+        "ela_score":  round(ela_score, 2),
+    }
 
 
 def _extract_images_from_pdf(pdf_bytes: bytes) -> list:
@@ -623,3 +1368,96 @@ def detect_video_url(url: str) -> dict:
         },
         "frames": frame_results,
     }
+
+
+# ── Voice deepfake detection ──────────────────────────────────────────────────
+
+class _VoiceModel:
+    """
+    ResNet-18 trained on Mel spectrograms for voice deepfake detection.
+    Weights: backend/detector/best_voice_model.pt
+    Input: audio bytes (WebM/WAV/MP3) → 3-channel 224×224 Mel spectrogram image
+    Output: fake_prob in [0, 1]
+    """
+    _instance = None
+    WEIGHTS   = os.path.join(os.path.dirname(__file__), "best_voice_model.pt")
+    SR        = 16_000   # sample rate used during training
+    N_MELS    = 128
+    HOP       = 512
+    N_FFT     = 2048
+    DURATION  = 3.0      # seconds per chunk
+
+    def __new__(cls):
+        if cls._instance is None:
+            import torchvision.models as tvm
+            obj = super().__new__(cls)
+            obj.device = "cuda" if torch.cuda.is_available() else "cpu"
+            net = tvm.resnet18(weights=None)
+            net.fc = torch.nn.Linear(512, 1)
+            state = torch.load(cls.WEIGHTS, map_location=obj.device)
+            net.load_state_dict(state)
+            net.eval()
+            obj.net = net.to(obj.device)
+            cls._instance = obj
+        return cls._instance
+
+    def predict(self, audio_bytes: bytes) -> dict:
+        import librosa
+        import tempfile, pathlib
+
+        # Write to temp file so librosa can handle any format via soundfile/ffmpeg
+        suffix = ".webm"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
+            tf.write(audio_bytes)
+            tmp_path = tf.name
+
+        try:
+            y, _ = librosa.load(tmp_path, sr=self.SR, mono=True,
+                                duration=self.DURATION)
+        finally:
+            pathlib.Path(tmp_path).unlink(missing_ok=True)
+
+        if len(y) < self.SR * 0.5:
+            return {"prediction": "unknown", "fake_prob": None,
+                    "confidence": None, "error": "Audio too short (<0.5s)"}
+
+        mel = librosa.feature.melspectrogram(
+            y=y, sr=self.SR, n_fft=self.N_FFT,
+            hop_length=self.HOP, n_mels=self.N_MELS,
+        )
+        mel_db = librosa.power_to_db(mel, ref=np.max)
+        # Normalise to [0, 1] then to ImageNet stats
+        mel_norm = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-8)
+
+        # Resize to 224×224 via PIL
+        pil_mel = Image.fromarray((mel_norm * 255).astype(np.uint8)).resize(
+            (224, 224), Image.BILINEAR
+        )
+        arr = np.array(pil_mel, dtype=np.float32) / 255.0
+        arr = np.stack([arr] * 3, axis=0)
+        mean = np.array([0.485, 0.456, 0.406])[:, None, None]
+        std  = np.array([0.229, 0.224, 0.225])[:, None, None]
+        arr  = (arr - mean) / std
+
+        tensor = torch.tensor(arr, dtype=torch.float32).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            logit    = self.net(tensor).squeeze()
+            fake_prob = float(torch.sigmoid(logit).item())
+
+        prediction = "fake" if fake_prob >= 0.5 else "real"
+        confidence = round(fake_prob * 100 if prediction == "fake"
+                           else (1 - fake_prob) * 100, 2)
+        return {
+            "prediction": prediction,
+            "fake_prob":  round(fake_prob, 4),
+            "confidence": confidence,
+        }
+
+
+_voice_model: "_VoiceModel | None" = None
+
+def analyze_voice(audio_bytes: bytes) -> dict:
+    global _voice_model
+    if _voice_model is None:
+        _voice_model = _VoiceModel()
+    return _voice_model.predict(audio_bytes)

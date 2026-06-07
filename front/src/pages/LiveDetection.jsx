@@ -121,7 +121,7 @@ const LiveDetection = ({ onBack }) => {
             formData.append('challenge_token', token);
             formData.append('source', 'live');
 
-            const response = await fetch('http://localhost:8000/api/detect/', {
+            const response = await fetch(`${import.meta.env.VITE_API_URL}/api/detect/`, {
                 method: 'POST',
                 body: formData,
             });
@@ -153,7 +153,7 @@ const LiveDetection = ({ onBack }) => {
 
         // Step 1: obtain server-issued challenge token (injection defense)
         try {
-            const res = await fetch('http://localhost:8000/api/live/challenge/');
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/api/live/challenge/`);
             if (!res.ok) throw new Error('Server error');
             const data = await res.json();
             challengeTokenRef.current = data.token;

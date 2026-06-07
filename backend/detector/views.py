@@ -5,7 +5,7 @@ from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.conf import settings
 
-from .services import combined_predict, detect_in_document, detect_video_url
+from .services import combined_predict, detect_in_document, detect_video_url, analyze_voice
 from .challenge import generate_challenge_token, verify_challenge_token, verify_frame_motion
 
 
@@ -62,13 +62,16 @@ class ImageDetectionView(APIView):
         result = combined_predict(io.BytesIO(frames_bytes[2]), live=True, explain=False)
         return Response(result)
 
-    # ── Static image upload ───────────────────────────────────────────────────
+    # ── Static image upload / video-call quick scan ───────────────────────────
 
     def _handle_upload(self, request):
         file = request.data.get('image')
         if not file:
             return Response({"error": "No image uploaded"}, status=400)
-        result = combined_predict(file, live=False, explain=True)
+        source = request.data.get('source', 'upload')
+        # videocall: skip heatmap/ELA generation for speed (3-second polling)
+        explain = source != 'videocall'
+        result = combined_predict(file, live=False, explain=explain)
         return Response(result)
 
 
@@ -103,3 +106,18 @@ class DocumentDetectionView(APIView):
         if result.get("error") and not result.get("results"):
             return Response(result, status=400)
         return Response(result)
+
+
+class VoiceDetectionView(APIView):
+    """POST /api/detect/voice/ — voice deepfake detection from audio clip."""
+    parser_classes = (MultiPartParser, FormParser)
+
+    def post(self, request, *args, **kwargs):
+        audio_file = request.data.get('audio')
+        if not audio_file:
+            return Response({"error": "No audio file provided"}, status=400)
+        try:
+            result = analyze_voice(audio_file.read())
+            return Response(result)
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
