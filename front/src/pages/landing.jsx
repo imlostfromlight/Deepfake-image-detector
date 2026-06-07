@@ -1,10 +1,10 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import { useDropzone } from 'react-dropzone';
 import {
     Shield, Upload, Loader2, AlertTriangle, CheckCircle2, FileImage,
-    Monitor, FileText, Info, ChevronDown, ChevronUp, Users, Layers,
-    Fingerprint, Eye, Search, Zap, Activity, Cpu, ScanLine, ShieldAlert,
-    ShieldCheck, BarChart2, Mic2, Waves
+    Monitor, FileText, ChevronDown, ChevronUp, Users, Layers,
+    Fingerprint, Eye, Search, Zap, Activity, ScanLine, ShieldAlert,
+    ShieldCheck, BarChart2, Lock, RefreshCw
 } from 'lucide-react';
 
 const API = import.meta.env.VITE_API_URL;
@@ -48,8 +48,8 @@ const VerdictHeader = ({ result }) => {
 
     return (
         <div className={`relative overflow-hidden rounded-2xl ${isFake
-            ? 'bg-gradient-to-br from-red-700 via-red-600 to-red-800'
-            : 'bg-gradient-to-br from-green-700 via-emerald-600 to-green-800'
+            ? 'bg-linear-to-br from-red-700 via-red-600 to-red-800'
+            : 'bg-linear-to-br from-green-700 via-emerald-600 to-green-800'
         }`}>
             {/* Background icon */}
             <div className="absolute right-4 top-1/2 -translate-y-1/2 opacity-10">
@@ -271,6 +271,165 @@ const FaceGrid = ({ faces }) => (
     </div>
 );
 
+/* ── Robustness panel ─────────────────────────────────────────────────────── */
+const ATTACK_ICON = {
+    jpeg_q50:   '🗜️',
+    jpeg_q20:   '🗜️',
+    noise_s15:  '📡',
+    blur_r2:    '🌀',
+    brightness: '🌑',
+    screenshot: '📸',
+};
+
+const RobustnessPanel = ({ file }) => {
+    const [status,   setStatus]   = useState('idle');   // idle | loading | done | error
+    const [data,     setData]     = useState(null);
+    const [errMsg,   setErrMsg]   = useState('');
+
+    const run = async () => {
+        if (!file) return;
+        setStatus('loading');
+        setData(null);
+        setErrMsg('');
+        const fd = new FormData();
+        fd.append('image', file);
+        try {
+            const res = await fetch(`${API}/api/detect/robustness/`, { method: 'POST', body: fd });
+            const json = await res.json();
+            if (!res.ok) throw new Error(json.error || 'Server error');
+            setData(json);
+            setStatus('done');
+        } catch (e) {
+            setErrMsg(e.message);
+            setStatus('error');
+        }
+    };
+
+    if (status === 'idle') return (
+        <button onClick={run}
+            className="w-full mt-1 flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-sm font-semibold text-slate-300 transition">
+            <Lock className="w-4 h-4 text-blue-400" />
+            Test Evasion Robustness — can attackers bypass our detector?
+        </button>
+    );
+
+    if (status === 'loading') return (
+        <div className="w-full mt-1 flex items-center justify-center gap-3 px-4 py-4 rounded-xl bg-slate-800 border border-slate-700 text-sm text-slate-400">
+            <Loader2 className="w-4 h-4 animate-spin text-blue-400" />
+            Applying 6 evasion attacks and re-running ML ensemble…
+        </div>
+    );
+
+    if (status === 'error') return (
+        <div className="w-full mt-1 px-4 py-3 rounded-xl bg-red-950 border border-red-800 text-sm text-red-300">
+            {errMsg}
+            <button onClick={() => setStatus('idle')} className="ml-3 underline text-red-400">Retry</button>
+        </div>
+    );
+
+    const allCaught = data.caught === data.total;
+
+    return (
+        <div className="mt-1 rounded-xl overflow-hidden border border-slate-700">
+            {/* Header */}
+            <div className={`px-4 py-3 flex items-center justify-between ${allCaught ? 'bg-emerald-950' : 'bg-amber-950'}`}>
+                <div className="flex items-center gap-2">
+                    {allCaught
+                        ? <ShieldCheck className="w-5 h-5 text-emerald-400" />
+                        : <ShieldAlert className="w-5 h-5 text-amber-400" />}
+                    <span className={`text-sm font-bold ${allCaught ? 'text-emerald-300' : 'text-amber-300'}`}>
+                        {allCaught
+                            ? `Fully robust — detected across all ${data.total} attack types`
+                            : `Bypassed ${data.total - data.caught} / ${data.total} attacks — consider threshold tuning`}
+                    </span>
+                </div>
+                <button onClick={() => setStatus('idle')}
+                    className="text-slate-500 hover:text-slate-300 transition">
+                    <RefreshCw className="w-3.5 h-3.5" />
+                </button>
+            </div>
+
+            {/* Attack grid — 2 cols, each card shows the actual attacked image */}
+            <div className="bg-slate-900 p-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {data.attacks.map(atk => (
+                    <div key={atk.key}
+                        className={`rounded-xl overflow-hidden border ${
+                            atk.caught
+                                ? 'border-emerald-800/60'
+                                : 'border-red-800/60'
+                        }`}>
+
+                        {/* Attacked image preview */}
+                        <div className="relative">
+                            {atk.thumb ? (
+                                <img
+                                    src={atk.thumb}
+                                    alt={atk.label}
+                                    className="w-full h-36 object-cover"
+                                />
+                            ) : (
+                                <div className="w-full h-36 bg-slate-800 flex items-center justify-center text-slate-600 text-xs">
+                                    No preview
+                                </div>
+                            )}
+                            {/* Verdict badge overlay */}
+                            <div className={`absolute top-2 right-2 flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold ${
+                                atk.caught
+                                    ? 'bg-red-600 text-white'
+                                    : 'bg-slate-700 text-slate-300'
+                            }`}>
+                                {atk.caught ? '🔍 DETECTED' : '⚠️ EVADED'}
+                            </div>
+                            {/* Attack icon badge */}
+                            <div className="absolute top-2 left-2 text-lg leading-none bg-black/40 rounded-lg px-1.5 py-0.5">
+                                {ATTACK_ICON[atk.key] ?? '⚡'}
+                            </div>
+                        </div>
+
+                        {/* Info row */}
+                        <div className={`px-3 py-2.5 ${
+                            atk.caught ? 'bg-emerald-900/20' : 'bg-red-900/15'
+                        }`}>
+                            <p className="text-xs text-slate-300 font-semibold mb-1.5 leading-tight">{atk.label}</p>
+                            {atk.prob != null ? (
+                                <>
+                                    <div className="w-full bg-slate-800 rounded-full h-1.5">
+                                        <div
+                                            className={`h-1.5 rounded-full transition-all duration-1000 ${atk.caught ? 'bg-red-500' : 'bg-slate-600'}`}
+                                            style={{ width: `${atk.prob}%` }} />
+                                    </div>
+                                    <p className={`text-xs mt-1.5 font-bold ${atk.caught ? 'text-red-400' : 'text-slate-500'}`}>
+                                        {atk.prob}% fake
+                                        <span className="text-slate-600 font-normal ml-1.5">
+                                            vs {data.threshold}% threshold
+                                            {atk.caught ? ' → still caught' : ' → below threshold'}
+                                        </span>
+                                    </p>
+                                </>
+                            ) : (
+                                <p className="text-xs text-slate-600 mt-1">Error running attack</p>
+                            )}
+                        </div>
+                    </div>
+                ))}
+            </div>
+
+            {/* Explanation */}
+            <div className="bg-slate-900 px-4 py-3 border-t border-slate-800">
+                <p className="text-xs text-slate-500 leading-relaxed">
+                    <span className="text-slate-400 font-semibold">What this shows: </span>
+                    Each image above is the actual modified copy sent to the model — you can see
+                    the compression artifacts, noise, blur, and darkening applied.
+                    The ML ensemble re-ran on each one from scratch.
+                    If the detector still flags it, it's genuinely robust to that bypass technique.
+                </p>
+            </div>
+        </div>
+    );
+};
+
+
+
 /* ─────────────────────────────────────────────────────────────────────────── */
 /* Main Page                                                                   */
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -280,10 +439,12 @@ const LandingPage = ({ onStartLive, onStartVideoCall, onStartDocument, onStartVi
     const [loading, setLoading]           = useState(false);
     const [showAnalysis, setShowAnalysis] = useState(false);
     const [activeViz, setActiveViz]       = useState('original');
+    const uploadedFileRef                  = useRef(null);
 
     const onDrop = useCallback(async (acceptedFiles) => {
         const file = acceptedFiles[0];
         if (!file) return;
+        uploadedFileRef.current = file;
         setImagePreview(URL.createObjectURL(file));
         setLoading(true);
         setResult(null);
@@ -667,6 +828,12 @@ const LandingPage = ({ onStartLive, onStartVideoCall, onStartDocument, onStartVi
                                 <p>Results will appear here after upload</p>
                             </div>
                         )}
+
+                        {/* Evasion robustness test — shown when a deepfake is detected */}
+                        {result && result.overall === 'deepfake' && !loading && (
+                            <RobustnessPanel file={uploadedFileRef.current} />
+                        )}
+
                     </div>
                 </div>
             </header>

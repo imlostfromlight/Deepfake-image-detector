@@ -1,28 +1,22 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
-import { Shield, Monitor, ArrowLeft, CheckCircle2, AlertTriangle, Square, Play, Mic, MicOff } from 'lucide-react';
+import { Shield, Monitor, ArrowLeft, CheckCircle2, AlertTriangle, Square, Play } from 'lucide-react';
 
 const CAPTURE_INTERVAL_MS = 3000;
-const AUDIO_INTERVAL_MS   = 4000;   // voice analysis slightly offset from video
 const MAX_HISTORY = 8;
 
 const API = import.meta.env.VITE_API_URL;
 
 const VideoCallDetection = ({ onBack }) => {
-    const videoRef        = useRef(null);
-    const streamRef       = useRef(null);
-    const intervalRef     = useRef(null);
-    const audioIntervalRef = useRef(null);
-    const analyzeRef      = useRef(false);
-    const mediaRecRef     = useRef(null);
-    const audioChunksRef  = useRef([]);
+    const videoRef    = useRef(null);
+    const streamRef   = useRef(null);
+    const intervalRef = useRef(null);
+    const analyzeRef  = useRef(false);
 
-    const [isCapturing, setIsCapturing]     = useState(false);
-    const [result, setResult]               = useState(null);
-    const [voiceResult, setVoiceResult]     = useState(null);
-    const [history, setHistory]             = useState([]);
-    const [error, setError]                 = useState(null);
-    const [isAnalyzing, setIsAnalyzing]     = useState(false);
-    const [hasAudio, setHasAudio]           = useState(false);
+    const [isCapturing, setIsCapturing] = useState(false);
+    const [result, setResult]           = useState(null);
+    const [history, setHistory]         = useState([]);
+    const [error, setError]             = useState(null);
+    const [isAnalyzing, setIsAnalyzing] = useState(false);
 
     // ── Video frame analysis ────────────────────────────────────────────────
     const captureAndAnalyze = useCallback(() => {
@@ -42,13 +36,13 @@ const VideoCallDetection = ({ onBack }) => {
             try {
                 const fd = new FormData();
                 fd.append('image', new File([blob], 'frame.png', { type: 'image/png' }));
-                fd.append('source', 'videocall');   // skips challenge token + heatmap
+                fd.append('source', 'videocall');
                 const res = await fetch(`${API}/api/detect/`, { method: 'POST', body: fd });
                 if (!res.ok) throw new Error('Server error');
                 const data = await res.json();
                 setResult(data);
                 setHistory(prev => [
-                    { ...data, time: new Date().toLocaleTimeString(), kind: 'video' },
+                    { ...data, time: new Date().toLocaleTimeString() },
                     ...prev,
                 ].slice(0, MAX_HISTORY));
                 setError(null);
@@ -61,37 +55,10 @@ const VideoCallDetection = ({ onBack }) => {
         }, 'image/png');
     }, []);
 
-    // ── Audio analysis ──────────────────────────────────────────────────────
-    const analyzeAudio = useCallback(async () => {
-        const chunks = audioChunksRef.current.splice(0);
-        if (!chunks.length) return;
-        const blob = new Blob(chunks, { type: 'audio/webm' });
-        if (blob.size < 1000) return;   // skip near-empty chunks
-        try {
-            const fd = new FormData();
-            fd.append('audio', new File([blob], 'clip.webm', { type: 'audio/webm' }));
-            const res = await fetch(`${API}/api/detect/voice/`, { method: 'POST', body: fd });
-            if (!res.ok) return;
-            const data = await res.json();
-            if (data.fake_prob !== null) {
-                setVoiceResult(data);
-                setHistory(prev => [
-                    { overall: data.prediction, deepfake: { confidence: data.confidence }, time: new Date().toLocaleTimeString(), kind: 'voice' },
-                    ...prev,
-                ].slice(0, MAX_HISTORY));
-            }
-        } catch { /* silent — audio is best-effort */ }
-    }, []);
-
     // ── Start / stop ────────────────────────────────────────────────────────
     const stopCapture = useCallback(() => {
         clearInterval(intervalRef.current);
-        clearInterval(audioIntervalRef.current);
         intervalRef.current = null;
-        audioIntervalRef.current = null;
-        if (mediaRecRef.current && mediaRecRef.current.state !== 'inactive') {
-            mediaRecRef.current.stop();
-        }
         if (streamRef.current) {
             streamRef.current.getTracks().forEach(t => t.stop());
             streamRef.current = null;
@@ -103,29 +70,10 @@ const VideoCallDetection = ({ onBack }) => {
     const startCapture = useCallback(async () => {
         setError(null);
         try {
-            const stream = await navigator.mediaDevices.getDisplayMedia({
-                video: true,
-                audio: true,     // capture tab/system audio if browser allows
-            });
+            const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
             streamRef.current = stream;
             if (videoRef.current) videoRef.current.srcObject = stream;
             stream.getVideoTracks()[0].addEventListener('ended', stopCapture);
-
-            // Check if we got audio tracks
-            const audioTracks = stream.getAudioTracks();
-            const gotAudio = audioTracks.length > 0;
-            setHasAudio(gotAudio);
-
-            if (gotAudio) {
-                // Set up MediaRecorder on the audio stream
-                const audioStream = new MediaStream(audioTracks);
-                const rec = new MediaRecorder(audioStream, { mimeType: 'audio/webm' });
-                rec.ondataavailable = e => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
-                rec.start(500);   // collect chunks every 500ms
-                mediaRecRef.current = rec;
-                audioIntervalRef.current = setInterval(analyzeAudio, AUDIO_INTERVAL_MS);
-            }
-
             setIsCapturing(true);
             intervalRef.current = setInterval(captureAndAnalyze, CAPTURE_INTERVAL_MS);
         } catch (err) {
@@ -133,17 +81,15 @@ const VideoCallDetection = ({ onBack }) => {
                 setError('Failed to start screen capture. Try a different browser or check permissions.');
             }
         }
-    }, [captureAndAnalyze, analyzeAudio, stopCapture]);
+    }, [captureAndAnalyze, stopCapture]);
 
     useEffect(() => () => stopCapture(), [stopCapture]);
 
     // ── Derived state ───────────────────────────────────────────────────────
-    const videoFake  = result?.overall === 'deepfake';
-    const voiceFake  = voiceResult?.prediction === 'fake';
-    const anyFake    = videoFake || voiceFake;
+    const isFake = result?.overall === 'deepfake';
 
     const alertLevel = !isCapturing ? 'idle'
-        : anyFake               ? 'danger'
+        : isFake                    ? 'danger'
         : result?.overall === 'real' ? 'safe'
         : 'scanning';
 
@@ -154,7 +100,7 @@ const VideoCallDetection = ({ onBack }) => {
         danger:   'border-red-600 bg-red-900/30 animate-pulse',
     };
 
-    const deepfakeCount = history.filter(h => h.overall === 'deepfake' || h.overall === 'fake').length;
+    const deepfakeCount = history.filter(h => h.overall === 'deepfake').length;
 
     return (
         <div className="min-h-screen bg-slate-900 text-white flex flex-col">
@@ -178,8 +124,7 @@ const VideoCallDetection = ({ onBack }) => {
                         </div>
                         <ol className="space-y-1.5 text-slate-300 text-sm list-decimal list-inside">
                             <li>Click <strong>Start Screen Capture</strong> and select the tab or window with your video call</li>
-                            <li>Allow audio sharing when prompted — enables voice deepfake detection</li>
-                            <li>Frames are analysed every 3s (video) and 4s (voice) automatically</li>
+                            <li>Frames are analysed every 3s automatically for deepfake faces</li>
                         </ol>
                         <p className="text-xs text-slate-500 mt-3">
                             Works with Google Meet, Zoom (web), Teams, and any browser-based call
@@ -193,18 +138,12 @@ const VideoCallDetection = ({ onBack }) => {
                         <div className="flex items-center gap-3">
                             <span className={`w-3 h-3 rounded-full animate-pulse ${alertLevel === 'danger' ? 'bg-red-500' : alertLevel === 'safe' ? 'bg-green-500' : 'bg-blue-500'}`} />
                             <span className="font-semibold text-sm">
-                                {alertLevel === 'danger' && '⚠ DEEPFAKE DETECTED'}
-                                {alertLevel === 'safe'   && '✓ Call appears authentic'}
+                                {alertLevel === 'danger'   && '⚠ DEEPFAKE DETECTED'}
+                                {alertLevel === 'safe'     && '✓ Call appears authentic'}
                                 {alertLevel === 'scanning' && 'Scanning...'}
                             </span>
                         </div>
-                        <div className="flex items-center gap-3 text-xs text-slate-400">
-                            {hasAudio
-                                ? <span className="flex items-center gap-1 text-green-400"><Mic className="w-3 h-3" />Voice active</span>
-                                : <span className="flex items-center gap-1 text-slate-500"><MicOff className="w-3 h-3" />No audio</span>
-                            }
-                            <span>{history.length} frames · {deepfakeCount} flagged</span>
-                        </div>
+                        <span className="text-xs text-slate-400">{history.length} frames · {deepfakeCount} flagged</span>
                     </div>
                 )}
 
@@ -228,29 +167,18 @@ const VideoCallDetection = ({ onBack }) => {
                             Analyzing...
                         </div>
                     )}
-                    {/* Live scores overlay */}
-                    {isCapturing && (result || voiceResult) && (
-                        <div className="absolute bottom-3 right-3 flex flex-col gap-1.5 items-end">
-                            {result && (
-                                <div className={`flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-bold backdrop-blur-sm border ${
-                                    result.overall === 'real'
-                                        ? 'bg-green-900/90 text-green-300 border-green-700'
-                                        : 'bg-red-900/90 text-red-300 border-red-600'
-                                }`}>
-                                    {result.overall === 'real' ? <CheckCircle2 className="w-3.5 h-3.5" /> : <AlertTriangle className="w-3.5 h-3.5" />}
-                                    Face: {result.overall === 'real' ? 'Real' : 'Deepfake'} · {result.deepfake?.confidence}%
-                                </div>
-                            )}
-                            {voiceResult && voiceResult.fake_prob !== null && (
-                                <div className={`flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-bold backdrop-blur-sm border ${
-                                    voiceResult.prediction === 'real'
-                                        ? 'bg-green-900/90 text-green-300 border-green-700'
-                                        : 'bg-red-900/90 text-red-300 border-red-600'
-                                }`}>
-                                    <Mic className="w-3.5 h-3.5" />
-                                    Voice: {voiceResult.prediction === 'real' ? 'Real' : 'Deepfake'} · {voiceResult.confidence}%
-                                </div>
-                            )}
+                    {isCapturing && result && (
+                        <div className="absolute bottom-3 right-3">
+                            <div className={`flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-bold backdrop-blur-sm border ${
+                                result.overall === 'real'
+                                    ? 'bg-green-900/90 text-green-300 border-green-700'
+                                    : 'bg-red-900/90 text-red-300 border-red-600'
+                            }`}>
+                                {result.overall === 'real'
+                                    ? <CheckCircle2 className="w-3.5 h-3.5" />
+                                    : <AlertTriangle className="w-3.5 h-3.5" />}
+                                Face: {result.overall === 'real' ? 'Real' : 'Deepfake'} · {result.deepfake?.confidence}%
+                            </div>
                         </div>
                     )}
                 </div>
@@ -266,7 +194,7 @@ const VideoCallDetection = ({ onBack }) => {
                             <Square className="w-4 h-4" />Stop Capture
                         </button>
                     )}
-                    <span className="text-xs text-slate-500">Video every {CAPTURE_INTERVAL_MS / 1000}s · Voice every {AUDIO_INTERVAL_MS / 1000}s</span>
+                    <span className="text-xs text-slate-500">Video frame every {CAPTURE_INTERVAL_MS / 1000}s</span>
                 </div>
 
                 {error && (
@@ -279,7 +207,7 @@ const VideoCallDetection = ({ onBack }) => {
                         <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Analysis History</h3>
                         <div className="space-y-2">
                             {history.map((item, i) => {
-                                const fake = item.overall === 'deepfake' || item.overall === 'fake';
+                                const fake = item.overall === 'deepfake';
                                 return (
                                     <div key={i} className={`flex items-center justify-between px-4 py-3 rounded-xl text-sm border ${
                                         fake ? 'bg-red-900/20 border-red-800/60' : 'bg-green-900/10 border-green-900/50'
@@ -293,11 +221,6 @@ const VideoCallDetection = ({ onBack }) => {
                                                 {item.overall}
                                             </span>
                                             <span className="text-slate-400">· {item.deepfake?.confidence}%</span>
-                                            {item.kind === 'voice' && (
-                                                <span className="text-xs text-purple-400 flex items-center gap-1">
-                                                    <Mic className="w-3 h-3" />voice
-                                                </span>
-                                            )}
                                         </div>
                                         <span className="text-slate-500 text-xs tabular-nums">{item.time}</span>
                                     </div>

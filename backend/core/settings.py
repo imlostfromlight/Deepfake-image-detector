@@ -109,6 +109,9 @@ STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
+MEDIA_URL  = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+
 # CORS — allow all in dev, specific origins in prod via env var
 _cors_origins = os.environ.get('CORS_ALLOWED_ORIGINS', '')
 if _cors_origins:

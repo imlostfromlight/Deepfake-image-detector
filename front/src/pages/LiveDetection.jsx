@@ -211,7 +211,7 @@ const LiveDetection = ({ onBack }) => {
         turn_left:  '← Slowly turn your head LEFT',
         turn_right: 'Slowly turn your head RIGHT →',
         verifying:  'Analyzing...',
-        complete:   result?.overall === 'real' ? 'Verification passed' : `Detected: ${result?.overall?.toUpperCase()}`,
+        complete:   result?.overall === 'real' ? 'Verification passed' : `Detected: ${result?.liveness?.prediction === 'spoof' ? 'SPOOF' : 'DEEPFAKE'}`,
         failed:     error || 'Motion not detected — please try again',
     }[phase] ?? '';
 
@@ -325,7 +325,7 @@ const LiveDetection = ({ onBack }) => {
                                     : <AlertTriangle className="w-14 h-14 text-red-400 mx-auto mb-2" />
                                 }
                                 <div className={`text-2xl font-black ${result?.overall === 'real' ? 'text-green-300' : 'text-red-300'}`}>
-                                    {result?.overall?.toUpperCase()}
+                                    {result?.overall === 'real' ? 'REAL' : result?.liveness?.prediction === 'spoof' ? 'SPOOF' : 'DEEPFAKE'}
                                 </div>
                                 <div className="text-xs text-slate-300 mt-1">
                                     {result?.deepfake?.confidence}% confidence

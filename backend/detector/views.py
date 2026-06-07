@@ -5,7 +5,8 @@ from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.conf import settings
 
-from .services import combined_predict, detect_in_document, detect_video_url, analyze_voice
+from .services import combined_predict, detect_in_document, detect_video_url, robustness_attack_test
+from .training import start_retraining, get_status as get_train_status
 from .challenge import generate_challenge_token, verify_challenge_token, verify_frame_motion
 
 
@@ -108,16 +109,69 @@ class DocumentDetectionView(APIView):
         return Response(result)
 
 
-class VoiceDetectionView(APIView):
-    """POST /api/detect/voice/ — voice deepfake detection from audio clip."""
+
+class FeedbackView(APIView):
+    """
+    POST /api/feedback/
+    Stores a user-corrected label for an uploaded image.
+    Fields: image (file), predicted ('real'|'deepfake'), true_label ('real'|'deepfake')
+    """
     parser_classes = (MultiPartParser, FormParser)
 
     def post(self, request, *args, **kwargs):
-        audio_file = request.data.get('audio')
-        if not audio_file:
-            return Response({"error": "No audio file provided"}, status=400)
+        image      = request.data.get('image')
+        true_label = (request.data.get('true_label') or '').strip()
+        predicted  = (request.data.get('predicted')  or '').strip()
+
+        if not image or true_label not in ('real', 'deepfake'):
+            return Response({'error': 'image and true_label (real|deepfake) required'}, status=400)
+
+        from .models import FeedbackSample
+        FeedbackSample.objects.create(
+            image=image,
+            true_label=true_label,
+            predicted=predicted,
+            was_correct=(true_label == predicted),
+        )
+        pending = FeedbackSample.objects.filter(used_in_train=False).count()
+        return Response({'status': 'saved', 'pending_samples': pending})
+
+
+class RetrainView(APIView):
+    """POST /api/retrain/ — launch background head fine-tuning."""
+
+    def post(self, request, *args, **kwargs):
+        started = start_retraining(settings.DEEPFAKE_MODEL_PATH)
+        if not started:
+            return Response({'error': 'Training already in progress'}, status=409)
+        return Response({'status': 'started'})
+
+
+class RetrainStatusView(APIView):
+    """GET /api/retrain/status/ — training state + sample counts."""
+
+    def get(self, request, *args, **kwargs):
+        return Response(get_train_status())
+
+
+class RobustnessTestView(APIView):
+    """
+    POST /api/detect/robustness/
+    Takes the same image, applies 6 evasion attacks (JPEG compression, noise,
+    blur, brightness shift, screenshot resize) and re-runs the ML ensemble on
+    each variant.  Returns per-attack fake probabilities so the frontend can
+    show that the detector is robust to common bypass techniques.
+    """
+    parser_classes = (MultiPartParser, FormParser)
+
+    def post(self, request, *args, **kwargs):
+        img_file = request.data.get('image')
+        if not img_file:
+            return Response({"error": "No image provided"}, status=400)
         try:
-            result = analyze_voice(audio_file.read())
+            from PIL import Image
+            pil = Image.open(img_file).convert("RGB")
+            result = robustness_attack_test(pil)
             return Response(result)
         except Exception as e:
             return Response({"error": str(e)}, status=500)
